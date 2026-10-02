@@ -20,7 +20,7 @@ from .audit.log import AuditLog
 from .audit.record import AuditRecord
 from .clock import Clock, SystemClock
 from .config import PlatformConfig, default_config
-from .errors import PlantError
+from .errors import InterlockError, PlantError
 from .eventbus import Event, EventBus
 from .field.field import FieldController
 from .field.persist import FieldPersistence
@@ -66,6 +66,8 @@ from .temp.solar import ClearSkyProfile
 from .temp.temp import build_report
 from .wash.cycle import WashCycle
 from .wash.drain import DrainSystem
+from .wash.manager import WashManager, wash_events
+from .wash.plan.budget import TruckCondition
 from .wash.truck import WashTruck
 
 DEFAULT_UNIT = "field1"
@@ -179,6 +181,9 @@ class Platform:
         self.truck = WashTruck(self.config.wash)
         self.drain = DrainSystem(self.config.wash)
         self.wash_cycle = WashCycle()
+        self.wash_manager = WashManager(
+            self.config.wash, self.field, self.wash_cycle, self.truck, self.drain
+        )
 
         self._cycles = 0
         self._operations = 0
@@ -430,6 +435,127 @@ class Platform:
             self._operations += 1
             self._persist()
             return {**report, **summary}
+
+    # ---- 按脏度排程的清洗 ----------------------------------------------
+
+    def wash_plan(self, dirt: list[dict], zone: str = "maint-north") -> dict:
+        """按镜面脏度建立清洗顺序、批次与回站补水点（不喷淋）。
+
+        ``dirt`` 形如 ``[{"name": "m021", "grade": 5}, ...]``；位置与分区从镜场
+        台账取，批次策略在配置里定死为 grade_first（脏度优先，区域连片仅同档裁决）。
+        """
+
+        with self._lock:
+            if not dirt:
+                raise InterlockError("清洗排程必须提供至少一面镜子的脏度", component="wash")
+            result = self.wash_manager.load_dirt(dirt, zone, self.truck.water_m3())
+            schedule = result["plan"]
+            self.bus.publish(
+                Event.of(
+                    "wash", "wash", "wash_plan_built",
+                    severity="notice",
+                    message=f"已按 {schedule['batch_policy']} 排出清洗排程",
+                    version=schedule["version"],
+                    batches=schedule["batches_total"],
+                    mirrors_per_full_tank=schedule["mirrors_per_full_tank"],
+                    per_mirror_m3=schedule["per_mirror_m3"],
+                    zone=zone,
+                )
+            )
+            return result
+
+    def wash_step(self) -> dict:
+        """执行排程到下一挂起点：洗完一面、需回站补水，或全部洗完。"""
+
+        with self._lock:
+            op_id = self.ids.next()
+            report = self.wash_manager.run_due(self.clock.now())
+            self._publish_wash_report(op_id, report)
+            self._operations += 1
+            self._persist()
+            return {"op_id": op_id, **report, "violations": list(report.get("violations", []))}
+
+    def wash_update_dirt(self, mirror: str, grade: int) -> dict:
+        """清洗进行中更新一面镜子的脏度，排程自动只重排未洗部分并落审计。"""
+
+        with self._lock:
+            result = self.wash_manager.update_dirt(mirror, grade)
+            self.bus.publish(
+                Event.of(
+                    "wash", "wash", "wash_dirt_updated",
+                    severity="notice",
+                    message=f"{mirror} 脏度更新为 {grade}，已重排未洗部分",
+                    mirror=mirror,
+                    grade=int(grade),
+                    version=result["schedule"]["version"],
+                )
+            )
+            return result
+
+    def wash_refill(self, water_m3: float | None = None) -> dict:
+        """回站补满水并按新批重排、重开避让窗口。"""
+
+        with self._lock:
+            op_id = self.ids.next()
+            report = self.wash_manager.refill_and_resume(self.clock.now(), water_m3)
+            self._publish_wash_report(op_id, report)
+            self._operations += 1
+            self._persist()
+            return {"op_id": op_id, **report}
+
+    def wash_report_water(
+        self,
+        *,
+        water_reading_ok: bool = True,
+        water_m3: float | None = None,
+        pump_ok: bool = True,
+        drive_ok: bool = True,
+        near_station: bool = False,
+    ) -> dict:
+        """上报车况与水量回读；回读缺失（部分失败）按水量不足处理并触发回站重排。"""
+
+        with self._lock:
+            condition = TruckCondition(
+                water_reading_ok=water_reading_ok,
+                water_m3=water_m3,
+                pump_ok=pump_ok,
+                drive_ok=drive_ok,
+                near_station=near_station,
+                ts=self.clock.now(),
+            )
+            result = self.wash_manager.report_condition(condition)
+            self.bus.publish(
+                Event.of(
+                    "wash", "wash", "wash_water_reported",
+                    severity="warning" if result["reading"]["status"] == "missing" else "notice",
+                    message="水量回读缺失，按不足处理并回站补水"
+                    if result["reading"]["status"] == "missing"
+                    else "水量回读已更新",
+                    **{k: (round(v, 4) if isinstance(v, float) else v)
+                       for k, v in result["reading"].items()},
+                )
+            )
+            return result
+
+    def _publish_wash_report(self, op_id: str, report: dict) -> None:
+        """把清洗排程执行报告的每一步、违约项与重排事件发布到审计总线。"""
+
+        for event in wash_events(report):
+            payload = dict(event.payload)
+            payload["op_id"] = op_id
+            self.bus.publish(Event.of(event.topic, event.component, event.action, **payload))
+        violations = list(report.get("violations", []))
+        self.bus.publish(
+            Event.of(
+                "audit", "audit", "wash_step_complete",
+                severity="notice" if report.get("ok") and not violations else "warning",
+                message="清洗步骤完成" if report.get("ok") and not violations else "清洗步骤有保留",
+                op_id=op_id,
+                suspended=report.get("suspended") or "",
+                mirror=report.get("mirror", ""),
+                violations=violations,
+            )
+        )
 
     def trip(self, reason: str = "overtemperature") -> dict:
         """停堆保护：闩锁 → 镜场收起 → 汽机旁路 → 关母管。"""
@@ -752,6 +878,8 @@ class Platform:
             "steam_pressure_updates": self.steam.pressure.updates(),
             "bypass_held_open_s": round(self.steam.bypass.held_open_s(self.clock.now()), 3),
             "wash": self.truck.snapshot(),
+            "wash_schedule": self.wash_manager.view(),
+            "wash_consistency": self.wash_manager.consistency_violations(),
             "drain": {
                 "tray_m3": round(self.drain.tray_m3(), 4),
                 "recovered_m3": round(self.drain.recovered_m3(), 4),

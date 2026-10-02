@@ -56,6 +56,12 @@ class Api:
         add("GET", "/api/store", self._store)
         add("GET", "/api/readiness", self._readiness)
         add("GET", "/api/window", lambda params, body: {"mirrors": self._platform.mirrors_in_window()})
+        add("GET", "/api/wash/plan", self._wash_plan_get)
+        add("POST", "/api/wash/plan", self._wash_plan)
+        add("POST", "/api/wash/step", lambda params, body: self._platform.wash_step())
+        add("POST", "/api/wash/refill", self._wash_refill)
+        add("POST", "/api/wash/dirt", self._wash_dirt)
+        add("POST", "/api/wash/water", self._wash_water)
         add("POST", "/api/track", self._track)
         add("POST", "/api/circulate", self._circulate)
         add("POST", "/api/cycle", self._cycle)
@@ -248,6 +254,39 @@ class Api:
         mirrors = body.get("mirrors")
         batch = None if not mirrors else [str(item) for item in mirrors]
         return self._platform.wash(batch, str(body.get("zone", "maint-north")))
+
+    def _wash_plan_get(self, params: dict, body: dict) -> dict:
+        return {"schedule": self._platform.wash_manager.view()}
+
+    def _wash_plan(self, params: dict, body: dict) -> dict:
+        dirt = body.get("dirt")
+        if not isinstance(dirt, list) or not dirt:
+            raise PlantError("请求体必须包含非空的 dirt 列表", component="console")
+        rows: list[dict] = []
+        for item in dirt:
+            if not isinstance(item, dict) or "name" not in item or "grade" not in item:
+                raise PlantError("dirt 每项必须含 name 与 grade", component="console")
+            rows.append({"name": str(item["name"]), "grade": int(item["grade"])})
+        return self._platform.wash_plan(rows, str(body.get("zone", "maint-north")))
+
+    def _wash_refill(self, params: dict, body: dict) -> dict:
+        water = body.get("water_m3")
+        return self._platform.wash_refill(None if water is None else float(water))
+
+    def _wash_dirt(self, params: dict, body: dict) -> dict:
+        if "mirror" not in body or "grade" not in body:
+            raise PlantError("请求体必须含 mirror 与 grade", component="console")
+        return self._platform.wash_update_dirt(str(body["mirror"]), int(body["grade"]))
+
+    def _wash_water(self, params: dict, body: dict) -> dict:
+        water = body.get("water_m3")
+        return self._platform.wash_report_water(
+            water_reading_ok=bool(body.get("water_reading_ok", True)),
+            water_m3=None if water is None else float(water),
+            pump_ok=bool(body.get("pump_ok", True)),
+            drive_ok=bool(body.get("drive_ok", True)),
+            near_station=bool(body.get("near_station", False)),
+        )
 
     def _trip(self, params: dict, body: dict) -> dict:
         return self._platform.trip(str(body.get("reason", "overtemperature")))

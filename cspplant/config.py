@@ -253,6 +253,12 @@ class WashLimits:
     return_flow_m3_h: float
     drain_lead_s: float
     truck_capacity_m3: float
+    # 回站保底水量与水箱安全余量：任何一批洗完都必须还剩这么多水，防止把水用干。
+    return_reserve_m3: float
+    truck_safety_m3: float
+    # 脏度分档（1 干净 … 5 最脏）；批次策略只允许 grade_first。
+    dirt_max_grade: int
+    batch_policy: str
 
     @classmethod
     def from_mapping(cls, section: Mapping[str, Any]) -> "WashLimits":
@@ -261,10 +267,26 @@ class WashLimits:
             return_flow_m3_h=_number(section, "return_flow_m3_h", minimum=0.1),
             drain_lead_s=_number(section, "drain_lead_s", minimum=0.0),
             truck_capacity_m3=_number(section, "truck_capacity_m3", minimum=0.1),
+            return_reserve_m3=_number(section, "return_reserve_m3", minimum=0.0),
+            truck_safety_m3=_number(section, "truck_safety_m3", minimum=0.0),
+            dirt_max_grade=_integer(section, "dirt_max_grade", minimum=2),
+            batch_policy=str(section.get("batch_policy", "grade_first")),
         )
         if limits.drain_lead_s >= limits.wash_duration_s:
             raise ConfigError("排空提前量必须小于喷淋时长", component="config")
+        if limits.return_reserve_m3 >= limits.truck_capacity_m3:
+            raise ConfigError("回站保底水量必须小于水箱容量", component="config")
+        if limits.batch_policy != "grade_first":
+            raise ConfigError(
+                f"批次策略只能是 grade_first（脏度优先，区域连片仅作同档平局裁决）: {limits.batch_policy}",
+                component="config",
+            )
         return limits
+
+    def water_per_mirror_m3(self) -> float:
+        """单面镜子的名义喷淋耗水（毛额，不假设回水回收）。"""
+
+        return self.return_flow_m3_h * self.wash_duration_s / 3600.0
 
 
 @dataclass(frozen=True)
@@ -349,7 +371,7 @@ def default_config() -> PlatformConfig:
         receiver=ReceiverLimits(600.0, 620.0, 720.0, 42.0, 20.0, 8.0, 22.0),
         salt=SaltLimits(18.0, 96.0, 1.4, 15.0, 58.0, 9.0, 2.5, 3.4),
         steam=SteamLimits(12.0, 0.8, 6.0, 30.0, 1.0),
-        wash=WashLimits(90.0, 26.0, 4.0, 9.0),
+        wash=WashLimits(90.0, 26.0, 4.0, 9.0, 0.6, 0.2, 5, "grade_first"),
         alarm=AlarmLimits(5.0, 120.0),
     )
 
@@ -411,6 +433,10 @@ def config_to_mapping(cfg: PlatformConfig) -> dict:
                 "return_flow_m3_h": cfg.wash.return_flow_m3_h,
                 "drain_lead_s": cfg.wash.drain_lead_s,
                 "truck_capacity_m3": cfg.wash.truck_capacity_m3,
+                "return_reserve_m3": cfg.wash.return_reserve_m3,
+                "truck_safety_m3": cfg.wash.truck_safety_m3,
+                "dirt_max_grade": cfg.wash.dirt_max_grade,
+                "batch_policy": cfg.wash.batch_policy,
             },
             "alarm": {
                 "latch_reset_delay_s": cfg.alarm.latch_reset_delay_s,

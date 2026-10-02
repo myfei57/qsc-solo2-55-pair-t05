@@ -23,6 +23,7 @@ packages = [
     "cspplant.steam",
     "cspplant.temp",
     "cspplant.wash",
+    "cspplant.wash.plan",
     "cspplant.alarm",
     "cspplant.sequence",
     "cspplant.console",

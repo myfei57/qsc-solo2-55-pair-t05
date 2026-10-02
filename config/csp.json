@@ -54,7 +54,11 @@
       "wash_duration_s": 90.0,
       "return_flow_m3_h": 26.0,
       "drain_lead_s": 4.0,
-      "truck_capacity_m3": 9.0
+      "truck_capacity_m3": 9.0,
+      "return_reserve_m3": 0.6,
+      "truck_safety_m3": 0.2,
+      "dirt_max_grade": 5,
+      "batch_policy": "grade_first"
     },
     "alarm": {
       "latch_reset_delay_s": 5.0,

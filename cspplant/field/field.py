@@ -85,6 +85,12 @@ class FieldController:
         return self._limits
 
     @property
+    def registry(self):
+        """定日镜台账（坐标、分区、镜面积），供清洗排程取位置。"""
+
+        return self._registry
+
+    @property
     def aim_point(self) -> AimPoint:
         return self._aim_point
 

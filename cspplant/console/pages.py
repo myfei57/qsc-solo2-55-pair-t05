@@ -11,7 +11,7 @@ from html import escape
 
 from ..app import Platform
 
-PAGE_PATHS: tuple[str, ...] = ("/", "/receiver", "/salt", "/alarms")
+PAGE_PATHS: tuple[str, ...] = ("/", "/receiver", "/salt", "/wash", "/alarms")
 
 _STYLE = """
 body { font-family: ui-sans-serif, system-ui, sans-serif; margin: 0; background: #0f1720; color: #e6edf3; }
@@ -45,6 +45,7 @@ def _shell(title: str, body: str) -> str:
             ("/", "镜场"),
             ("/receiver", "吸热器"),
             ("/salt", "熔盐"),
+            ("/wash", "清洗"),
             ("/alarms", "告警"),
         )
     )
@@ -147,10 +148,64 @@ def _alarm_page(platform: Platform) -> str:
     return _shell("告警控制台", body)
 
 
+def _wash_page(platform: Platform) -> str:
+    """清洗页：脏度批次、一车水洗几面、水量回读与回站补水点。"""
+
+    sched = platform.status().get("wash_schedule", {})
+    water = sched.get("water")
+    water_text = "-"
+    if water is not None:
+        flag = "（回读缺失·按不足处理）" if water.get("status") == "missing" else ""
+        water_text = f"{water['water_m3']} m³{flag}"
+    rows = [
+        ("批次策略", sched.get("batch_policy", "-")),
+        ("版本", sched.get("version", 0)),
+        ("模式", sched.get("mode", "-")),
+        ("单面耗水 (m³)", sched.get("per_mirror_m3", "-")),
+        ("水箱容量 (m³)", sched.get("truck_capacity_m3", "-")),
+        ("回站保底 (m³)", sched.get("return_reserve_m3", "-")),
+        ("满车可洗（面）", sched.get("mirrors_per_full_tank", "-")),
+        ("当前车载水量", water_text),
+        ("可用水 (m³)", sched.get("usable_m3", "-")),
+        ("正在洗", sched.get("active_mirror") or "-"),
+        ("下一动作", sched.get("next_action") or "-"),
+        ("批次数 / 已完成", f"{sched.get('batches_total', 0)} / {sched.get('batches_finished', 0)}"),
+        ("已完成补水次数", sched.get("refills_completed", 0)),
+        ("一致性违约", platform.status().get("wash_consistency", []) or "无"),
+    ]
+    body = _table("清洗排程", rows)
+
+    batch_rows: list[tuple[str, object]] = []
+    for batch in sched.get("plan", {}).get("batches", []):
+        grades = ",".join(str(g) for g in batch["grades"])
+        batch_rows.append(
+            (
+                batch["batch_id"],
+                f"{batch['state']}｜{batch['count']} 面｜脏度[{grades}]｜"
+                f"名义耗水 {batch['water_need_m3']} m³｜洗完余水 {batch['water_leaving_m3']} m³",
+            )
+        )
+    body += _table("批次（脏度优先）", batch_rows or [("暂无排程", "-")])
+
+    task_rows: list[tuple[str, object]] = []
+    state_text = {"pending": "待执行", "active": "清洗中", "done": "完成"}
+    for task in sched.get("plan", {}).get("tasks", []):
+        if task["kind"] == "wash":
+            task_rows.append(
+                (f"{task['batch_id']} · {task['mirror']}",
+                 f"洗镜面｜脏度 {task['grade']}｜分区 {task['group']}｜{state_text.get(task['state'], task['state'])}")
+            )
+        else:
+            task_rows.append((task["task_id"], f"回站补水｜{state_text.get(task['state'], task['state'])}"))
+    body += _table("作业时序", task_rows or [("暂无", "-")])
+    return _shell("清洗控制台", body)
+
+
 _RENDERERS = {
     "/": _mirror_page,
     "/receiver": _receiver_page,
     "/salt": _salt_page,
+    "/wash": _wash_page,
     "/alarms": _alarm_page,
 }
 
