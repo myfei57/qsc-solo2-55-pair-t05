@@ -49,7 +49,7 @@ from .sequence import (
     reset_after_trip,
     shutdown_plant,
     startup_plant,
-    wash_mirrors,
+    wash_campaign,
 )
 from .steam.bypass import BypassValve
 from .steam.pressure import SteamPressure
@@ -65,8 +65,12 @@ from .temp.profile import TemperatureProfile
 from .temp.solar import ClearSkyProfile
 from .temp.temp import build_report
 from .wash.cycle import WashCycle
+from .wash.dirtiness import DIRT_BANDS, DirtinessLedger
 from .wash.drain import DrainSystem
+from .wash.persist import WashPersistence
+from .wash.schedule import WashScheduler
 from .wash.truck import WashTruck
+from .wash.water import WaterBudget
 
 DEFAULT_UNIT = "field1"
 DEFAULT_MIRROR = "m021"
@@ -179,6 +183,18 @@ class Platform:
         self.truck = WashTruck(self.config.wash)
         self.drain = DrainSystem(self.config.wash)
         self.wash_cycle = WashCycle()
+        self.wash_persistence = WashPersistence(store)
+        self.dirtiness = DirtinessLedger(default_dirtiness=0.3)
+        self.water_budget = WaterBudget(self.config.wash)
+        self.wash_scheduler = WashScheduler(
+            self.config.wash,
+            self.dirtiness,
+            self.water_budget,
+            max_batch=self.config.field.sweep_batch,
+        )
+        self._campaign_seq = 0
+        self._seed_dirtiness()
+        self._restore_wash()
 
         self._cycles = 0
         self._operations = 0
@@ -417,19 +433,195 @@ class Platform:
             self._persist()
             return {**report, **summary}
 
-    def wash(self, mirrors: list[str] | None = None, zone: str = "maint-north") -> dict:
-        """按批次清洗镜面。"""
+    def wash(
+        self,
+        mirrors: list[str] | None = None,
+        zone: str = "maint-north",
+        *,
+        dirtiness: dict[str, float] | None = None,
+        readback_water_m3: float | None = -1.0,
+    ) -> dict:
+        """按脏度排程清洗镜面。
+
+        批次排序定死为脏度优先、同档区域连片；一车水按净用水封批，不够时
+        由车况策略决定缩批或回站补水后重排。``readback_water_m3`` 给
+        ``None`` 模拟水位回读缺失（部分失败，按不足处理）；默认 -1 哨兵
+        表示"回读健康且等于名义水位"。
+        """
 
         with self._lock:
             op_id = self.ids.next()
-            batch = list(mirrors) if mirrors else self.field.sweeps.plan(self.heliostats.names())[0]
-            report = wash_mirrors(
-                self.field, self.wash_cycle, self.truck, self.drain, batch, zone, self.clock.now()
+            self._campaign_seq += 1
+            campaign_id = f"wash-{self._campaign_seq:04d}"
+            if dirtiness:
+                self.dirtiness.update(dirtiness)
+            if mirrors is None:
+                mirrors = self.heliostats.names()
+            if readback_water_m3 is None:
+                sensor: float | None = None
+            elif readback_water_m3 == -1.0:
+                sensor = self.truck.water_m3()
+            else:
+                sensor = float(readback_water_m3)
+            report = wash_campaign(
+                self.field,
+                self.wash_scheduler,
+                self.wash_cycle,
+                self.truck,
+                self.drain,
+                list(mirrors),
+                zone,
+                self.clock.now(),
+                campaign_id=campaign_id,
+                readback_water_m3=sensor,
             )
+            self._persist_wash()
             summary = self._record_operation(op_id, "wash", report)
+            self._publish_wash_schedule(report)
             self._operations += 1
             self._persist()
             return {**report, **summary}
+
+    def wash_plan(self, mirrors: list[str] | None = None) -> dict:
+        """只排不洗：返回当前脏度下的清洗顺序与批次（供控制台预览）。"""
+
+        with self._lock:
+            names = list(mirrors) if mirrors is not None else self.heliostats.names()
+            schedule = self.wash_scheduler.plan(
+                "preview", names, self.truck.effective_water_m3(self.clock.now()),
+                self.field.mirror_coords(),
+            )
+            return {
+                "schedule": schedule.as_dict(),
+                "water": self.truck.water_status(self.clock.now()),
+                "budget": self.water_budget.summary(),
+                "expected_washes": self.water_budget.expected_washes(
+                    self.truck.effective_water_m3(self.clock.now())
+                ),
+            }
+
+    def set_dirtiness(self, readings: dict[str, float]) -> dict:
+        """录入／更新镜面脏度（重排输入），返回更新后脏度明细。"""
+
+        with self._lock:
+            changed = self.dirtiness.update(readings)
+            self.wash_persistence.write_dirtiness(self.dirtiness.snapshot())
+            self.bus.publish(
+                Event.of(
+                    "wash",
+                    "wash",
+                    "mirror_dirtiness_updated",
+                    severity="notice",
+                    message=f"录入 {len(readings)} 面镜子脏度，{len(changed)} 面跨档",
+                    updated=len(readings),
+                    changed_band=len(changed),
+                )
+            )
+            return {"updated": len(readings), "changed_band": changed, "rows": self.dirtiness.rows()}
+
+    def report_truck_water(self, amount_m3: float | None) -> dict:
+        """登记车载水位回读；``None`` 表示本次回读缺失（部分失败）。"""
+
+        with self._lock:
+            fresh = self.truck.report_water(amount_m3, self.clock.now())
+            degraded = self.truck.readback_degraded(self.clock.now())
+            self.bus.publish(
+                Event.of(
+                    "wash",
+                    "wash",
+                    "truck_water_readback",
+                    severity="warning" if degraded else "notice",
+                    message="水位回读缺失，按水量不足处理" if degraded else "水位回读正常",
+                    readback_m3=None if amount_m3 is None else round(float(amount_m3), 4),
+                    degraded=degraded,
+                )
+            )
+            return self.truck.water_status(self.clock.now())
+
+    def wash_schedule_view(self) -> dict:
+        """返回当前排程、执行进度与脏度明细（控制台展示 + 审计同源）。"""
+
+        with self._lock:
+            schedule = self.wash_scheduler.schedule()
+            return {
+                "progress": self.wash_scheduler.progress(),
+                "schedule": None if schedule is None else schedule.as_dict(),
+                "dirtiness": self.dirtiness.rows(),
+                "bands": list(DIRT_BANDS),
+                "water": self.truck.water_status(self.clock.now()),
+                "budget": self.water_budget.summary(),
+            }
+
+    def _publish_wash_schedule(self, report: dict) -> None:
+        """把排程版本、水量账与一致性结果写成一条审计汇总。"""
+
+        degraded = bool(report.get("water", {}).get("readback_degraded"))
+        self.bus.publish(
+            Event.of(
+                "wash",
+                "wash",
+                "wash_schedule_committed",
+                severity="alarm" if not report.get("ok") else ("warning" if degraded else "notice"),
+                message=(
+                    "清洗排程与水量账不一致"
+                    if "wash_account_mismatch" in report.get("violations", [])
+                    else "清洗排程已提交"
+                ),
+                campaign_id=report.get("campaign_id", ""),
+                schedule_version=report.get("schedule_version", 0),
+                planned=report.get("mirrors", 0),
+                washed=report.get("washed", 0),
+                refills=report.get("refills", 0),
+                trims=report.get("trims", 0),
+                readback_degraded=degraded,
+                remaining_m3=report.get("water", {}).get("remaining_m3", 0.0),
+            )
+        )
+
+    def _seed_dirtiness(self) -> None:
+        """给全场一个确定性的脏度分布，让排序有明显脏净层次。
+
+        已落盘台账优先；未落盘时按镜名序号派生 0.05–0.95 的稳定值。
+        """
+
+        stored = self.wash_persistence.read_dirtiness()
+        if stored:
+            self.dirtiness.restore(stored)
+            return
+        for index, mirror in enumerate(self.heliostats.all()):
+            value = 0.05 + 0.9 * ((index * 37 % 101) / 100.0)
+            self.dirtiness.set(mirror.name, round(value, 3))
+        self.wash_persistence.write_dirtiness(self.dirtiness.snapshot())
+
+    def _persist_wash(self) -> dict | None:
+        """落盘脏度台账与排程游标，保证排程、水量、审计重启后口径一致。
+
+        战役结束后清掉游标文档（下一战重新排程），返回持久化的进度。
+        """
+
+        self.wash_persistence.write_dirtiness(self.dirtiness.snapshot())
+        progress = self.wash_scheduler.progress()
+        if progress["campaign_id"] and progress["remaining_mirrors"] > 0:
+            state = {**progress, "washed_mirror_names": self.wash_scheduler.washed_mirrors()}
+            self.wash_persistence.write_schedule_state(state)
+            return state
+        self.wash_persistence.clear_schedule_state()
+        return None
+
+    def _restore_wash(self) -> None:
+        """跨重启恢复脏度台账与未完成战役的执行游标。"""
+
+        stored = self.wash_persistence.read_dirtiness()
+        if stored:
+            self.dirtiness.restore(stored)
+        state = self.wash_persistence.read_schedule_state()
+        if state and state.get("remaining_mirrors", 0) > 0:
+            washed = [str(name) for name in state.get("washed_mirror_names", [])]
+            self.wash_scheduler.restore_state(
+                washed,
+                int(state.get("current_batch", 0) or 0) - 1,
+                str(state.get("phase", "idle")),
+            )
 
     def trip(self, reason: str = "overtemperature") -> dict:
         """停堆保护：闩锁 → 镜场收起 → 汽机旁路 → 关母管。"""
@@ -751,7 +943,12 @@ class Platform:
             "steam": self.steam.status(),
             "steam_pressure_updates": self.steam.pressure.updates(),
             "bypass_held_open_s": round(self.steam.bypass.held_open_s(self.clock.now()), 3),
-            "wash": self.truck.snapshot(),
+            "wash": {
+                **self.truck.snapshot(),
+                "water_status": self.truck.water_status(self.clock.now()),
+                "budget": self.water_budget.summary(),
+                "schedule": self.wash_scheduler.progress(),
+            },
             "drain": {
                 "tray_m3": round(self.drain.tray_m3(), 4),
                 "recovered_m3": round(self.drain.recovered_m3(), 4),

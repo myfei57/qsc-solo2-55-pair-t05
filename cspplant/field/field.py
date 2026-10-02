@@ -117,6 +117,11 @@ class FieldController:
 
         return [self._drives[name] for name in sorted(self._drives)]
 
+    def mirror_coords(self) -> dict[str, tuple[float, float]]:
+        """返回镜名到 (x, y) 坐标的映射，供清洗排程做同档连片。"""
+
+        return {mirror.name: (mirror.x_m, mirror.y_m) for mirror in self._registry.all()}
+
     def drive(self, name: str) -> HeliostatDrive:
         """按名字取一台定日镜驱动。"""
 

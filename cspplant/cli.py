@@ -24,7 +24,15 @@ from .config import config_to_mapping, default_config, load_config
 from .console.server import ConsoleServer, probe_endpoints
 from .errors import PlantError
 
-DEFAULT_PROBE_PATHS = ("/api/status", "/api/readiness", "/api/topology", "/api/audit", "/receiver")
+DEFAULT_PROBE_PATHS = (
+    "/api/status",
+    "/api/readiness",
+    "/api/topology",
+    "/api/wash/schedule",
+    "/api/audit",
+    "/receiver",
+    "/wash",
+)
 
 
 def _build(args: argparse.Namespace) -> Platform:
@@ -112,7 +120,20 @@ def _cmd_demo(args: argparse.Namespace) -> int:
             "ok": tracking_after_manual["ok"],
             "violations": tracking_after_manual["violations"],
         },
-        "washing": {key: washing[key] for key in ("ok", "washed", "mirrors", "violations")},
+        "washing": {
+            key: washing[key]
+            for key in (
+                "ok",
+                "washed",
+                "mirrors",
+                "refills",
+                "trims",
+                "schedule_version",
+                "readback_degraded_events",
+                "water",
+                "violations",
+            )
+        },
         "handoff": {key: handoff[key] for key in ("ok", "peak_pressure_mpa", "max_pumps_running", "violations")},
         "disturbance": disturbance,
         "trip": {key: trip[key] for key in ("ok", "latched", "violations")},

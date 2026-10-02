@@ -56,6 +56,10 @@ class Api:
         add("GET", "/api/store", self._store)
         add("GET", "/api/readiness", self._readiness)
         add("GET", "/api/window", lambda params, body: {"mirrors": self._platform.mirrors_in_window()})
+        add("GET", "/api/wash/schedule", self._wash_schedule)
+        add("GET", "/api/wash/plan", self._wash_plan)
+        add("POST", "/api/wash/dirtiness", self._wash_dirtiness)
+        add("POST", "/api/wash/water", self._wash_water)
         add("POST", "/api/track", self._track)
         add("POST", "/api/circulate", self._circulate)
         add("POST", "/api/cycle", self._cycle)
@@ -247,7 +251,36 @@ class Api:
     def _wash(self, params: dict, body: dict) -> dict:
         mirrors = body.get("mirrors")
         batch = None if not mirrors else [str(item) for item in mirrors]
-        return self._platform.wash(batch, str(body.get("zone", "maint-north")))
+        dirt = body.get("dirtiness")
+        dirtiness = None if not isinstance(dirt, dict) else {str(k): float(v) for k, v in dirt.items()}
+        readback = body.get("readback_water_m3", -1.0)
+        readback_arg = None if readback is None else float(readback)
+        return self._platform.wash(
+            batch,
+            str(body.get("zone", "maint-north")),
+            dirtiness=dirtiness,
+            readback_water_m3=readback_arg,
+        )
+
+    def _wash_schedule(self, params: dict, body: dict) -> dict:
+        return self._platform.wash_schedule_view()
+
+    def _wash_plan(self, params: dict, body: dict) -> dict:
+        mirrors_param = params.get("mirrors")
+        mirrors = None if not mirrors_param else [item for item in str(mirrors_param).split(",") if item]
+        return self._platform.wash_plan(mirrors)
+
+    def _wash_dirtiness(self, params: dict, body: dict) -> dict:
+        readings = body.get("readings", body)
+        if not isinstance(readings, dict):
+            raise PlantError("readings 必须是 镜名->脏度 的映射", component="console")
+        return self._platform.set_dirtiness({str(key): float(value) for key, value in readings.items()})
+
+    def _wash_water(self, params: dict, body: dict) -> dict:
+        if "amount_m3" not in body:
+            raise PlantError("缺少 amount_m3（null 表示回读缺失）", component="console")
+        amount = body["amount_m3"]
+        return self._platform.report_truck_water(None if amount is None else float(amount))
 
     def _trip(self, params: dict, body: dict) -> dict:
         return self._platform.trip(str(body.get("reason", "overtemperature")))

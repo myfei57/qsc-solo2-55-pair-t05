@@ -11,7 +11,7 @@ from html import escape
 
 from ..app import Platform
 
-PAGE_PATHS: tuple[str, ...] = ("/", "/receiver", "/salt", "/alarms")
+PAGE_PATHS: tuple[str, ...] = ("/", "/receiver", "/salt", "/wash", "/alarms")
 
 _STYLE = """
 body { font-family: ui-sans-serif, system-ui, sans-serif; margin: 0; background: #0f1720; color: #e6edf3; }
@@ -45,6 +45,7 @@ def _shell(title: str, body: str) -> str:
             ("/", "镜场"),
             ("/receiver", "吸热器"),
             ("/salt", "熔盐"),
+            ("/wash", "清洗"),
             ("/alarms", "告警"),
         )
     )
@@ -147,10 +148,66 @@ def _alarm_page(platform: Platform) -> str:
     return _shell("告警控制台", body)
 
 
+def _wash_page(platform: Platform) -> str:
+    """清洗页：脏度排序、批次水量预算、回读状态与回站记录。"""
+
+    view = platform.wash_schedule_view()
+    water = view["water"]
+    budget = view["budget"]
+    progress = view["progress"]
+    degraded = water["readback_degraded"]
+    water_rows = [
+        ("车载水位（名义下限 m³）", water["water_m3"]),
+        ("排程保守水位 (m³)", water["effective_water_m3"]),
+        ("最后回读 (m³)", "缺失" if water["readback_m3"] is None else water["readback_m3"]),
+        ("回读状态", "部分失败：按不足处理" if degraded else "正常"),
+        ("回站安全余量 (m³)", budget["reserve_m3"]),
+        ("单面基准毛用水 (m³)", budget["base_gross_m3"]),
+        ("回水回收率", f"{budget['recovery_ratio'] * 100:.0f}%"),
+        ("回站补水次数", water["refills"]),
+        ("累计补水量 (m³)", water["refilled_m3"]),
+    ]
+    body = _table("一车水账", water_rows)
+    prog_rows = [
+        ("战役", progress["campaign_id"] or "-"),
+        ("排程版本", progress["version"]),
+        ("阶段", progress["phase"]),
+        ("已洗 / 总数", f"{progress['washed_mirrors']} / {progress['total_mirrors']}"),
+        ("当前批次", progress["current_batch"] if progress["current_batch"] is not None else "-"),
+        ("批次数", progress["batch_count"]),
+    ]
+    body += _table("排程进度", prog_rows)
+
+    schedule = view["schedule"]
+    if schedule:
+        batch_rows: list[tuple[str, object]] = []
+        for batch in schedule["batches"]:
+            order = " → ".join(batch["mirrors"])
+            batch_rows.append(
+                (
+                    f"#{batch['seq']} [{batch['state']}]",
+                    f"{batch['size']} 面，净用水 {batch['water']['net_m3']} m³：{order}",
+                )
+            )
+        body += _table(f"批次（排序规则：{schedule['reason']}，脏度优先/同档连片）", batch_rows or [("无", "-")])
+
+    dirt_rows = [
+        (
+            item["mirror"],
+            f"{item['dirtiness']}（{item['band']}）",
+        )
+        for item in view["dirtiness"][:25]
+    ]
+    body += _table("脏度榜（前 25，脏的在前）", dirt_rows or [("无", "-")])
+    html = _shell("清洗控制台", body)
+    return html
+
+
 _RENDERERS = {
     "/": _mirror_page,
     "/receiver": _receiver_page,
     "/salt": _salt_page,
+    "/wash": _wash_page,
     "/alarms": _alarm_page,
 }
 
